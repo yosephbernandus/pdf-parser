@@ -30,13 +30,9 @@ pub enum Token {
 
     // Reference
     Ref,       // R
-    Trailed,   // trailed
+    Trailer,   // trailer
     StartXRef, // startxref
-}
-
-pub struct Lexer<'a> {
-    data: &'a [u8],
-    pos: usize,
+    XRef,      // xref <- referenced in read_keyword() but not in enum
 }
 
 pub struct Lexer<'a> {
@@ -47,6 +43,10 @@ pub struct Lexer<'a> {
 impl<'a> Lexer<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         Self { data, pos: 0 }
+    }
+
+    pub fn data(&self) -> &'a [u8] {
+        self.data
     }
 
     pub fn position(&self) -> usize {
