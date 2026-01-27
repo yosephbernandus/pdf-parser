@@ -35,6 +35,25 @@ fn main() {
                 Ok(count) => println!("\nPage count: {}", count),
                 Err(e) => println!("\nCould not get page count: {}", e),
             }
+
+            // Test stream decoding - read first page content
+            println!("\n--- Testing Stream Decoding ---");
+            match doc.get_page(0) {
+                Ok(page) => {
+                    println!("Got page 0");
+                    match doc.get_page_contents(&page) {
+                        Ok(content) => {
+                            println!("Content stream decoded: {} bytes", content.len());
+                            // Show first 500 chars of content stream
+                            let preview = String::from_utf8_lossy(&content);
+                            let preview: String = preview.chars().take(500).collect();
+                            println!("\nContent preview:\n{}", preview);
+                        }
+                        Err(e) => println!("Could not get page contents: {}", e),
+                    }
+                }
+                Err(e) => println!("Could not get page: {}", e),
+            }
         }
         Err(e) => {
             eprintln!("Error parsing PDF: {}", e);

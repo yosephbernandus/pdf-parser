@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::decode::decode_stream;
 use crate::error::{PdfError, Result};
 use crate::parser::Parser;
 use crate::types::{ObjRef, PdfObject};
@@ -359,6 +360,65 @@ impl<'a> Document<'a> {
             .ok_or_else(|| PdfError::InvalidStructure("Missing Count in Pages".into()))?;
 
         Ok(count as usize)
+    }
+
+    /// Get decoded stream content from an object reference
+    pub fn get_stream_data(&mut self, obj_ref: ObjRef) -> Result<Vec<u8>> {
+        let obj = self.resolve(obj_ref)?.clone();
+
+        match obj {
+            PdfObject::Stream { dict, data } => decode_stream(&dict, &data),
+            _ => Err(PdfError::InvalidStructure("Expected stream object".into())),
+        }
+    }
+
+    /// Get a page by index (0-based)
+    pub fn get_page(&mut self, index: usize) -> Result<PdfObject> {
+        let catalog = self.catalog()?;
+        let pages_ref = catalog
+            .as_dict()
+            .and_then(|d| d.get("Pages"))
+            .and_then(|p| p.as_ref())
+            .ok_or_else(|| PdfError::InvalidStructure("Missing Pages in catalog".into()))?;
+
+        let pages = self.resolve(pages_ref)?.clone();
+        let kids = pages
+            .as_dict()
+            .and_then(|d| d.get("Kids"))
+            .and_then(|k| k.as_array())
+            .ok_or_else(|| PdfError::InvalidStructure("Missing Kids in Pages".into()))?;
+
+        let page_ref = kids
+            .get(index)
+            .and_then(|p| p.as_ref())
+            .ok_or_else(|| PdfError::InvalidStructure(format!("Page {} not found", index)))?;
+
+        self.resolve(page_ref).cloned()
+    }
+
+    /// Get content stream(s) from a page
+    pub fn get_page_contents(&mut self, page: &PdfObject) -> Result<Vec<u8>> {
+        let contents = page
+            .as_dict()
+            .and_then(|d| d.get("Contents"))
+            .ok_or_else(|| PdfError::InvalidStructure("Page has no Contents".into()))?;
+
+        match contents {
+            PdfObject::Ref(r) => self.get_stream_data(*r),
+            PdfObject::Array(arr) => {
+                // Multiple content streams - concatenate
+                let mut result = Vec::new();
+                for item in arr {
+                    if let Some(r) = item.as_ref() {
+                        let data = self.get_stream_data(r)?;
+                        result.extend(data);
+                        result.push(b'\n'); // Separate streams
+                    }
+                }
+                Ok(result)
+            }
+            _ => Err(PdfError::InvalidStructure("Invalid Contents type".into())),
+        }
     }
 }
 
