@@ -62,11 +62,6 @@ impl<'a> Lexer<'a> {
         self.data.get(self.pos).copied()
     }
 
-    /// Peek at byte at offset from current position
-    fn peek_at(&self, offset: usize) -> Option<u8> {
-        self.data.get(self.pos + offset).copied()
-    }
-
     /// Read and consume one byte
     fn read_byte(&mut self) -> Result<u8> {
         let b = self.peek().ok_or_else(|| PdfError::Parse {

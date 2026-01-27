@@ -63,6 +63,12 @@ impl<'a> Parser<'a> {
                 self.parse_int_or_ref(n)
             }
 
+            // Skip "obj" keyword and parse the actual object
+            Token::Obj => self.parse_object(),
+
+            // Skip "endobj" - signals end of indirect object
+            Token::EndObj => Ok(None),
+
             _ => Err(PdfError::Parse {
                 position: self.position(),
                 message: format!("Unexpected token: {:?}", token),
