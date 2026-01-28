@@ -3,6 +3,7 @@ pub mod decode;
 pub mod document;
 pub mod error;
 pub mod extract;
+pub mod font;
 pub mod parser;
 pub mod types;
 

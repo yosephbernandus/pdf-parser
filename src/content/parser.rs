@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use crate::error::{PdfError, Result};
+use crate::font::FontEncoding;
 
 /// Extracted text with position information
 #[derive(Debug, Clone)]
@@ -63,6 +65,8 @@ pub struct ContentParser<'a> {
     state: GraphicsState,
     state_stack: Vec<GraphicsState>,
     spans: Vec<TextSpan>,
+    /// Font name -> encoding mapping
+    font_encodings: HashMap<String, FontEncoding>,
 }
 
 impl<'a> ContentParser<'a> {
@@ -73,6 +77,19 @@ impl<'a> ContentParser<'a> {
             state: GraphicsState::default(),
             state_stack: Vec::new(),
             spans: Vec::new(),
+            font_encodings: HashMap::new(),
+        }
+    }
+
+    /// Create parser with font encodings
+    pub fn with_fonts(data: &'a [u8], font_encodings: HashMap<String, FontEncoding>) -> Self {
+        Self {
+            data,
+            pos: 0,
+            state: GraphicsState::default(),
+            state_stack: Vec::new(),
+            spans: Vec::new(),
+            font_encodings,
         }
     }
 
@@ -112,7 +129,67 @@ impl<'a> ContentParser<'a> {
             }
         }
 
-        Ok(self.spans)
+        // Merge adjacent spans on the same line
+        Ok(self.merge_adjacent_spans())
+    }
+
+    /// Merge adjacent text spans that are on the same line and close together
+    fn merge_adjacent_spans(&self) -> Vec<TextSpan> {
+        if self.spans.is_empty() {
+            return Vec::new();
+        }
+
+        // Sort spans by y (descending = top to bottom) then x (ascending = left to right)
+        let mut sorted_spans = self.spans.clone();
+        sorted_spans.sort_by(|a, b| {
+            // First compare y (with tolerance for same line)
+            let y_diff = b.y - a.y;
+            if y_diff.abs() > a.font_size * 0.3 {
+                return y_diff.partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal);
+            }
+            // Same line - sort by x
+            a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut merged: Vec<TextSpan> = Vec::new();
+
+        for span in sorted_spans {
+            if let Some(last) = merged.last_mut() {
+                // Check if this span is on the same line (within tolerance)
+                let y_tolerance = last.font_size * 0.3;
+                let same_line = (span.y - last.y).abs() <= y_tolerance;
+
+                if same_line && last.font_name == span.font_name {
+                    // Estimate expected position based on accumulated text length
+                    // Use font_size * 0.5 as average character width estimate
+                    let char_width = last.font_size * 0.5;
+                    let expected_x = last.x + (last.text.len() as f64 * char_width);
+                    let gap = span.x - expected_x;
+
+                    // If gap is small, merge without space
+                    // If gap is moderate (word boundary), merge with space
+                    // If gap is large, start new span
+                    if gap < char_width * 0.8 && gap > -char_width * 2.0 {
+                        // Small gap - just append
+                        last.text.push_str(&span.text);
+                    } else if gap < char_width * 2.0 {
+                        // Word boundary - append with space
+                        last.text.push(' ');
+                        last.text.push_str(&span.text);
+                    } else {
+                        // Large gap - new span
+                        merged.push(span);
+                    }
+                } else {
+                    // Different line or font - new span
+                    merged.push(span);
+                }
+            } else {
+                merged.push(span);
+            }
+        }
+
+        merged
     }
 
     fn skip_whitespace(&mut self) {
@@ -502,18 +579,45 @@ impl<'a> ContentParser<'a> {
             // Show text with spacing: [(string) num (string) ...] TJ
             "TJ" => {
                 if let Some(Operand::Array(items)) = operands.last() {
+                    // Collect consecutive strings with small adjustments
+                    let mut combined_bytes: Vec<u8> = Vec::new();
+                    let mut span_start_x = self.state.x();
+                    let mut span_start_y = self.state.y();
+                    let mut has_content = false;
+
                     for item in items {
                         match item {
                             Operand::String(bytes) => {
-                                self.add_text_span(bytes);
+                                if !has_content {
+                                    span_start_x = self.state.x();
+                                    span_start_y = self.state.y();
+                                    has_content = true;
+                                }
+                                combined_bytes.extend(bytes);
+                                // Advance text position
+                                let advance = bytes.len() as f64 * self.state.font_size * 0.5;
+                                self.state.text_matrix[4] += advance;
                             }
                             Operand::Number(n) => {
                                 // Adjust position (negative = move right)
                                 let adjust = -n / 1000.0 * self.state.font_size;
+
+                                // If adjustment is large (> 200 units = word space), flush current span
+                                if n.abs() > 200.0 && has_content {
+                                    self.add_text_span_at(&combined_bytes, span_start_x, span_start_y);
+                                    combined_bytes.clear();
+                                    has_content = false;
+                                }
+
                                 self.state.text_matrix[4] += adjust;
                             }
                             _ => {}
                         }
+                    }
+
+                    // Flush remaining content
+                    if has_content && !combined_bytes.is_empty() {
+                        self.add_text_span_at(&combined_bytes, span_start_x, span_start_y);
                     }
                 }
             }
@@ -557,8 +661,43 @@ impl<'a> ContentParser<'a> {
     }
 
     fn add_text_span(&mut self, bytes: &[u8]) {
-        // Decode bytes to string (simple Latin-1 for now)
-        let text: String = bytes
+        let x = self.state.x();
+        let y = self.state.y();
+        self.add_text_span_at(bytes, x, y);
+
+        // Advance text position (simplified - doesn't account for actual glyph widths)
+        let advance = bytes.len() as f64 * self.state.font_size * 0.5;
+        self.state.text_matrix[4] += advance;
+    }
+
+    fn add_text_span_at(&mut self, bytes: &[u8], x: f64, y: f64) {
+        // Decode bytes using font encoding if available
+        let text = if let Some(font_name) = &self.state.font_name {
+            if let Some(encoding) = self.font_encodings.get(font_name) {
+                encoding.decode_bytes(bytes)
+            } else {
+                self.decode_default(bytes)
+            }
+        } else {
+            self.decode_default(bytes)
+        };
+
+        let text = text.trim().to_string();
+
+        if !text.is_empty() {
+            self.spans.push(TextSpan {
+                text,
+                x,
+                y,
+                font_size: self.state.font_size,
+                font_name: self.state.font_name.clone(),
+            });
+        }
+    }
+
+    /// Default decoding for bytes (Latin-1)
+    fn decode_default(&self, bytes: &[u8]) -> String {
+        bytes
             .iter()
             .map(|&b| {
                 if b >= 32 && b < 127 {
@@ -570,23 +709,7 @@ impl<'a> ContentParser<'a> {
                     ' '
                 }
             })
-            .collect();
-
-        let text = text.trim().to_string();
-
-        if !text.is_empty() {
-            self.spans.push(TextSpan {
-                text,
-                x: self.state.x(),
-                y: self.state.y(),
-                font_size: self.state.font_size,
-                font_name: self.state.font_name.clone(),
-            });
-        }
-
-        // Advance text position (simplified - doesn't account for actual glyph widths)
-        let advance = bytes.len() as f64 * self.state.font_size * 0.5;
-        self.state.text_matrix[4] += advance;
+            .collect()
     }
 }
 
@@ -640,6 +763,18 @@ mod tests {
     #[test]
     fn test_tj_array() {
         let content = b"BT /F1 12 Tf 100 700 Td [(Hello) -100 (World)] TJ ET";
+        let parser = ContentParser::new(content);
+        let spans = parser.parse().unwrap();
+
+        // Small adjustment (-100) causes spans to be merged
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].text, "HelloWorld");
+    }
+
+    #[test]
+    fn test_tj_array_with_large_gap() {
+        // Large adjustment (-2000) creates separate spans
+        let content = b"BT /F1 12 Tf 100 700 Td [(Hello) -2000 (World)] TJ ET";
         let parser = ContentParser::new(content);
         let spans = parser.parse().unwrap();
 

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::content::{ContentParser, TextSpan};
 use crate::decode::decode_stream;
 use crate::error::{PdfError, Result};
+use crate::font::{parse_tounicode_cmap, FontEncoding};
 use crate::parser::Parser;
 use crate::types::{ObjRef, PdfObject};
 
@@ -82,29 +83,54 @@ impl<'a> Document<'a> {
         }
     }
 
-    /// Parse xref table and trailer dictionary
+    /// Parse xref table and trailer dictionary, following Prev chain
     fn parse_xref_and_trailer(
         data: &[u8],
         offset: usize,
     ) -> Result<(HashMap<u32, XRefEntry>, HashMap<String, PdfObject>)> {
         let mut xref = HashMap::new();
+        let mut current_offset = offset;
+        let mut final_trailer: Option<HashMap<String, PdfObject>> = None;
 
-        // Check if this is a traditional xref table or xref stream
-        if data[offset..].starts_with(b"xref") {
-            // Traditional xref table
-            Self::parse_traditional_xref(data, offset, &mut xref)?;
+        // Follow the Prev chain to collect all xref entries
+        loop {
+            // Check if this is a traditional xref table or xref stream
+            if current_offset < data.len() && data[current_offset..].starts_with(b"xref") {
+                // Traditional xref table
+                Self::parse_traditional_xref(data, current_offset, &mut xref)?;
 
-            // Find and parse trailer
-            let trailer = Self::find_and_parse_trailer(data, offset)?;
+                // Find and parse trailer
+                let trailer = Self::find_and_parse_trailer(data, current_offset)?;
 
-            Ok((xref, trailer))
-        } else {
-            // Might be an xref stream (PDF 1.5+)
-            // TODO: Implement xref stream parsing
-            Err(PdfError::InvalidStructure(
-                "XRef streams not yet supported".into(),
-            ))
+                // Keep the most recent trailer (first one we encounter)
+                if final_trailer.is_none() {
+                    final_trailer = Some(trailer.clone());
+                }
+
+                // Check for Prev pointer to follow the chain
+                if let Some(prev_offset) = trailer.get("Prev").and_then(|p| p.as_int()) {
+                    current_offset = prev_offset as usize;
+                } else {
+                    break;
+                }
+            } else {
+                // Might be an xref stream (PDF 1.5+)
+                // TODO: Implement xref stream parsing
+                if final_trailer.is_some() {
+                    // We have at least one valid xref, continue
+                    break;
+                }
+                return Err(PdfError::InvalidStructure(
+                    "XRef streams not yet supported".into(),
+                ));
+            }
         }
+
+        let trailer = final_trailer.ok_or_else(|| {
+            PdfError::InvalidStructure("No valid trailer found".into())
+        })?;
+
+        Ok((xref, trailer))
     }
 
     /// Parse traditional xref table
@@ -345,7 +371,6 @@ impl<'a> Document<'a> {
 
     /// Get page count
     pub fn page_count(&mut self) -> Result<usize> {
-        // Catalog -> Pages -> Count
         let catalog = self.catalog()?;
         let pages_ref = catalog
             .as_dict()
@@ -353,14 +378,10 @@ impl<'a> Document<'a> {
             .and_then(|p| p.as_ref())
             .ok_or_else(|| PdfError::InvalidStructure("Missing Pages in catalog".into()))?;
 
-        let pages = self.resolve(pages_ref)?;
-        let count = pages
-            .as_dict()
-            .and_then(|d| d.get("Count"))
-            .and_then(|c| c.as_int())
-            .ok_or_else(|| PdfError::InvalidStructure("Missing Count in Pages".into()))?;
-
-        Ok(count as usize)
+        // Use recursive collection to count actual pages instead of relying on Count field
+        let mut all_pages = Vec::new();
+        self.collect_pages(pages_ref, &mut all_pages)?;
+        Ok(all_pages.len())
     }
 
     /// Get decoded stream content from an object reference
@@ -382,19 +403,56 @@ impl<'a> Document<'a> {
             .and_then(|p| p.as_ref())
             .ok_or_else(|| PdfError::InvalidStructure("Missing Pages in catalog".into()))?;
 
-        let pages = self.resolve(pages_ref)?.clone();
-        let kids = pages
-            .as_dict()
-            .and_then(|d| d.get("Kids"))
-            .and_then(|k| k.as_array())
-            .ok_or_else(|| PdfError::InvalidStructure("Missing Kids in Pages".into()))?;
+        // Collect all pages recursively
+        let mut all_pages = Vec::new();
+        self.collect_pages(pages_ref, &mut all_pages)?;
 
-        let page_ref = kids
+        all_pages
             .get(index)
-            .and_then(|p| p.as_ref())
-            .ok_or_else(|| PdfError::InvalidStructure(format!("Page {} not found", index)))?;
+            .cloned()
+            .ok_or_else(|| PdfError::InvalidStructure(format!("Page {} not found", index)))
+    }
 
-        self.resolve(page_ref).cloned()
+    /// Recursively collect all Page objects from a Pages tree
+    fn collect_pages(&mut self, node_ref: ObjRef, pages: &mut Vec<PdfObject>) -> Result<()> {
+        let node = self.resolve(node_ref)?.clone();
+        let dict = node
+            .as_dict()
+            .ok_or_else(|| PdfError::InvalidStructure("Expected dict in page tree".into()))?;
+
+        // Check the Type
+        let type_name = dict
+            .get("Type")
+            .and_then(|t| t.as_name())
+            .unwrap_or("");
+
+        match type_name {
+            "Page" => {
+                // It's a leaf page
+                pages.push(node.clone());
+            }
+            "Pages" => {
+                // It's an intermediate node - recurse into Kids
+                let kids = dict
+                    .get("Kids")
+                    .and_then(|k| k.as_array())
+                    .ok_or_else(|| PdfError::InvalidStructure("Pages node missing Kids".into()))?;
+
+                for kid in kids {
+                    if let Some(kid_ref) = kid.as_ref() {
+                        self.collect_pages(kid_ref, pages)?;
+                    }
+                }
+            }
+            _ => {
+                // Unknown type - try to treat as page
+                if dict.contains_key("Contents") || dict.contains_key("MediaBox") {
+                    pages.push(node.clone());
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Get content stream(s) from a page
@@ -426,8 +484,92 @@ impl<'a> Document<'a> {
     pub fn extract_page_text(&mut self, page_index: usize) -> Result<Vec<TextSpan>> {
         let page = self.get_page(page_index)?;
         let content = self.get_page_contents(&page)?;
-        let parser = ContentParser::new(&content);
+
+        // Load font encodings from page resources
+        let font_encodings = self.load_font_encodings(&page)?;
+
+        let parser = ContentParser::with_fonts(&content, font_encodings);
         parser.parse()
+    }
+
+    /// Load font encodings from page resources
+    fn load_font_encodings(&mut self, page: &PdfObject) -> Result<HashMap<String, FontEncoding>> {
+        let mut encodings = HashMap::new();
+
+        // Get Resources dictionary
+        let resources = match page.as_dict().and_then(|d| d.get("Resources")) {
+            Some(r) => self.get_object(r)?,
+            None => return Ok(encodings),
+        };
+
+        // Get Font dictionary from Resources
+        let fonts = match resources.as_dict().and_then(|d| d.get("Font")) {
+            Some(f) => self.get_object(f)?,
+            None => return Ok(encodings),
+        };
+
+        // Iterate over fonts
+        if let Some(font_dict) = fonts.as_dict() {
+            for (font_name, font_ref) in font_dict {
+                if let Ok(encoding) = self.load_single_font_encoding(font_ref) {
+                    encodings.insert(font_name.clone(), encoding);
+                }
+            }
+        }
+
+        Ok(encodings)
+    }
+
+    /// Load encoding for a single font
+    fn load_single_font_encoding(&mut self, font_ref: &PdfObject) -> Result<FontEncoding> {
+        let font = self.get_object(font_ref)?;
+        let font_dict = font.as_dict().ok_or_else(|| {
+            PdfError::InvalidStructure("Font is not a dictionary".into())
+        })?;
+
+        // Check for ToUnicode CMap first (most accurate)
+        if let Some(tounicode_ref) = font_dict.get("ToUnicode") {
+            if let Some(obj_ref) = tounicode_ref.as_ref() {
+                if let Ok(cmap_data) = self.get_stream_data(obj_ref) {
+                    if let Ok(cid_map) = parse_tounicode_cmap(&cmap_data) {
+                        return Ok(FontEncoding::from_cid_map(cid_map));
+                    }
+                }
+            }
+        }
+
+        // Check Encoding
+        if let Some(encoding) = font_dict.get("Encoding") {
+            match encoding {
+                PdfObject::Name(name) => {
+                    return Ok(match name.as_str() {
+                        "WinAnsiEncoding" => FontEncoding::win_ansi(),
+                        "MacRomanEncoding" => FontEncoding::mac_roman(),
+                        _ => FontEncoding::win_ansi(), // Default to WinAnsi
+                    });
+                }
+                PdfObject::Dict(enc_dict) => {
+                    // Custom encoding with Differences array
+                    // Start with base encoding
+                    let encoding = if let Some(base) = enc_dict.get("BaseEncoding") {
+                        match base.as_name() {
+                            Some("WinAnsiEncoding") => FontEncoding::win_ansi(),
+                            Some("MacRomanEncoding") => FontEncoding::mac_roman(),
+                            _ => FontEncoding::win_ansi(),
+                        }
+                    } else {
+                        FontEncoding::win_ansi()
+                    };
+
+                    // TODO: Apply Differences array
+                    return Ok(encoding);
+                }
+                _ => {}
+            }
+        }
+
+        // Default: WinAnsi encoding
+        Ok(FontEncoding::win_ansi())
     }
 
     /// Extract all text from a page as a single string
