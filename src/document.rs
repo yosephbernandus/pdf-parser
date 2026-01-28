@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::content::{ContentParser, TextSpan};
 use crate::decode::decode_stream;
 use crate::error::{PdfError, Result};
 use crate::parser::Parser;
@@ -419,6 +420,65 @@ impl<'a> Document<'a> {
             }
             _ => Err(PdfError::InvalidStructure("Invalid Contents type".into())),
         }
+    }
+
+    /// Extract text spans from a page (0-indexed)
+    pub fn extract_page_text(&mut self, page_index: usize) -> Result<Vec<TextSpan>> {
+        let page = self.get_page(page_index)?;
+        let content = self.get_page_contents(&page)?;
+        let parser = ContentParser::new(&content);
+        parser.parse()
+    }
+
+    /// Extract all text from a page as a single string
+    pub fn extract_page_text_string(&mut self, page_index: usize) -> Result<String> {
+        let spans = self.extract_page_text(page_index)?;
+
+        // Sort by y (descending) then x (ascending)
+        let mut spans = spans;
+        spans.sort_by(|a, b| {
+            b.y.partial_cmp(&a.y)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+        });
+
+        // Group into lines by y position
+        let mut lines: Vec<Vec<&TextSpan>> = Vec::new();
+        let mut current_line: Vec<&TextSpan> = Vec::new();
+        let mut current_y: Option<f64> = None;
+        let tolerance = 3.0;
+
+        for span in &spans {
+            match current_y {
+                Some(y) if (span.y - y).abs() <= tolerance => {
+                    current_line.push(span);
+                }
+                _ => {
+                    if !current_line.is_empty() {
+                        lines.push(current_line);
+                    }
+                    current_y = Some(span.y);
+                    current_line = vec![span];
+                }
+            }
+        }
+        if !current_line.is_empty() {
+            lines.push(current_line);
+        }
+
+        // Build text output
+        let text: String = lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        Ok(text)
     }
 }
 
