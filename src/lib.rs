@@ -2,6 +2,7 @@ pub mod content;
 pub mod decode;
 pub mod document;
 pub mod error;
+pub mod extract;
 pub mod parser;
 pub mod types;
 
@@ -9,5 +10,6 @@ pub use content::TextSpan;
 pub use decode::decode_stream;
 pub use document::Document;
 pub use error::{PdfError, Result};
+pub use extract::Table;
 pub use types::{ObjRef, PdfObject};
 
