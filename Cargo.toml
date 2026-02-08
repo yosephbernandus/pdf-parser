@@ -3,9 +3,16 @@ name = "pdf-parser"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 flate2 = "1.1.8"
 thiserror = "2.0.18"
+wasm-bindgen = "0.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1"
 
 [dev-dependencies]
 # For testing later
@@ -13,3 +20,7 @@ thiserror = "2.0.18"
 [[bin]]
 name = "pdf-table"
 path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true

@@ -1,5 +1,5 @@
 use std::fs;
-use pdf_parser::{Document, Table};
+use pdf_parser::{classify_spans, elements_to_markdown, elements_to_txt, Document, Table};
 
 fn print_usage(program: &str) {
     eprintln!("Usage: {} <pdf-file> [options]", program);
@@ -8,6 +8,8 @@ fn print_usage(program: &str) {
     eprintln!("  --csv       Output as CSV (default)");
     eprintln!("  --tsv       Output as TSV (tab-separated)");
     eprintln!("  --text      Output as aligned text");
+    eprintln!("  --txt       Output as plain text (headings, paragraphs, tables)");
+    eprintln!("  --md        Output as Markdown");
     eprintln!("  --raw       Output raw text spans with positions");
     eprintln!("  --page N    Extract only page N (1-indexed)");
     eprintln!("  -o FILE     Write output to FILE instead of stdout");
@@ -39,6 +41,8 @@ fn main() {
             "--csv" => format = "csv",
             "--tsv" => format = "tsv",
             "--text" => format = "text",
+            "--txt" => format = "txt",
+            "--md" => format = "md",
             "--raw" => format = "raw",
             "--page" => {
                 i += 1;
@@ -108,6 +112,19 @@ fn main() {
                             "[{:.1}, {:.1}] ({}pt): {}\n",
                             span.x, span.y, span.font_size, span.text
                         ));
+                    }
+                } else if format == "txt" || format == "md" {
+                    // Layout-aware extraction
+                    let elements = classify_spans(spans);
+
+                    if !output.is_empty() {
+                        output.push('\n');
+                    }
+
+                    match format {
+                        "txt" => output.push_str(&elements_to_txt(&elements)),
+                        "md" => output.push_str(&elements_to_markdown(&elements)),
+                        _ => unreachable!(),
                     }
                 } else {
                     // Table extraction

@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF Extractor</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: #0a0a0a;
+            color: #e0e0e0;
+            min-height: 100vh;
+            padding: 2rem;
+        }
+
+        .container {
+            max-width: 960px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            margin-bottom: 0.25rem;
+            color: #fff;
+        }
+
+        .subtitle {
+            color: #666;
+            font-size: 0.85rem;
+            margin-bottom: 1.5rem;
+        }
+
+        /* Drop zone */
+        .drop-zone {
+            border: 2px dashed #333;
+            border-radius: 8px;
+            padding: 3rem 2rem;
+            text-align: center;
+            cursor: pointer;
+            transition: border-color 0.2s, background 0.2s;
+        }
+
+        .drop-zone:hover,
+        .drop-zone.dragover {
+            border-color: #666;
+            background: #111;
+        }
+
+        .drop-zone input { display: none; }
+
+        .drop-zone p {
+            color: #888;
+            font-size: 0.9rem;
+        }
+
+        .drop-zone .hint {
+            color: #555;
+            font-size: 0.75rem;
+            margin-top: 0.5rem;
+        }
+
+        /* Status */
+        .status {
+            margin-top: 1rem;
+            padding: 0.75rem 1rem;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            display: none;
+        }
+
+        .status.error {
+            display: block;
+            background: #1a0000;
+            border: 1px solid #4a0000;
+            color: #ff6b6b;
+        }
+
+        .status.success {
+            display: block;
+            background: #001a00;
+            border: 1px solid #004a00;
+            color: #6bff6b;
+        }
+
+        .status.loading {
+            display: block;
+            background: #0a0a1a;
+            border: 1px solid #00004a;
+            color: #6b6bff;
+        }
+
+        /* Controls */
+        .controls {
+            display: flex;
+            gap: 0.5rem;
+            margin-top: 1rem;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        button {
+            padding: 0.5rem 1rem;
+            border: 1px solid #333;
+            border-radius: 6px;
+            background: #1a1a1a;
+            color: #e0e0e0;
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: background 0.2s;
+        }
+
+        button:hover { background: #2a2a2a; }
+        button:disabled { opacity: 0.4; cursor: not-allowed; }
+        button.primary { background: #1a3a1a; border-color: #2a5a2a; }
+        button.primary:hover { background: #2a4a2a; }
+
+        .spacer { flex: 1; }
+
+        .row-count {
+            color: #666;
+            font-size: 0.8rem;
+        }
+
+        /* Table display */
+        .table-wrapper {
+            margin-top: 1.5rem;
+            overflow-x: auto;
+            border: 1px solid #222;
+            border-radius: 8px;
+            max-height: 70vh;
+            overflow-y: auto;
+            display: none;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85rem;
+            font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+        }
+
+        th, td {
+            padding: 0.5rem 0.75rem;
+            border-bottom: 1px solid #1a1a1a;
+            text-align: left;
+            white-space: nowrap;
+        }
+
+        th {
+            background: #111;
+            font-weight: 600;
+            position: sticky;
+            top: 0;
+            z-index: 1;
+        }
+
+        tr:hover td { background: #111; }
+
+        /* Raw CSV */
+        .raw-csv {
+            margin-top: 1rem;
+            display: none;
+        }
+
+        textarea {
+            width: 100%;
+            height: 200px;
+            background: #111;
+            color: #e0e0e0;
+            border: 1px solid #222;
+            border-radius: 6px;
+            padding: 0.75rem;
+            font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+            font-size: 0.8rem;
+            resize: vertical;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>PDF Extractor</h1>
+        <p class="subtitle">Extract text, tables, and structured content from PDF files. Everything runs in your browser — no upload, no server.</p>
+
+        <div class="drop-zone" id="dropZone">
+            <p>Drop a PDF file here or click to select</p>
+            <p class="hint">Your file never leaves your browser</p>
+            <input type="file" id="fileInput" accept=".pdf">
+        </div>
+
+        <div class="status" id="status"></div>
+
+        <div class="controls" id="controls" style="display:none">
+            <button class="primary" id="downloadCsv">Download CSV</button>
+            <button id="downloadTsv">Download TSV</button>
+            <button id="downloadTxt">Download TXT</button>
+            <button id="downloadMd">Download MD</button>
+            <button id="toggleRaw">Show Raw</button>
+            <button id="copyBtn">Copy</button>
+            <span class="spacer"></span>
+            <span class="row-count" id="rowCount"></span>
+        </div>
+
+        <div class="table-wrapper" id="tableWrapper">
+            <table id="resultTable"></table>
+        </div>
+
+        <div class="raw-csv" id="rawCsv">
+            <textarea id="csvText" readonly></textarea>
+        </div>
+    </div>
+
+    <script type="module">
+        import init, { pdf_to_csv, pdf_to_tsv, pdf_to_txt, pdf_to_md } from '../pkg/pdf_parser.js';
+
+        let csvData = '';
+        let tsvData = '';
+        let txtData = '';
+        let mdData = '';
+        let fileName = '';
+
+        // Initialize WASM
+        async function initWasm() {
+            try {
+                await init();
+            } catch (e) {
+                showStatus('Failed to load WASM module: ' + e, 'error');
+            }
+        }
+
+        // Process PDF file
+        async function processPdf(file) {
+            fileName = file.name.replace(/\.pdf$/i, '');
+            showStatus('Parsing...', 'loading');
+
+            // Yield to let the UI update before heavy WASM work
+            await new Promise(r => setTimeout(r, 10));
+
+            try {
+                const buffer = await file.arrayBuffer();
+                const data = new Uint8Array(buffer);
+
+                const t0 = performance.now();
+                csvData = pdf_to_csv(data);
+                tsvData = pdf_to_tsv(data);
+                txtData = pdf_to_txt(data);
+                mdData = pdf_to_md(data);
+                const ms = (performance.now() - t0).toFixed(0);
+
+                const rows = displayTable(csvData);
+                document.getElementById('csvText').value = csvData;
+                document.getElementById('controls').style.display = 'flex';
+                document.getElementById('rowCount').textContent = rows + ' rows';
+                showStatus(
+                    `${file.name} (${formatSize(file.size)}) parsed in ${ms}ms`,
+                    'success'
+                );
+            } catch (e) {
+                showStatus('Error: ' + e, 'error');
+                document.getElementById('controls').style.display = 'none';
+                document.getElementById('tableWrapper').style.display = 'none';
+            }
+        }
+
+        // Parse CSV and render as HTML table. Returns row count.
+        function displayTable(csv) {
+            const rows = parseCsvRows(csv);
+            if (rows.length === 0) return 0;
+
+            const table = document.getElementById('resultTable');
+            table.innerHTML = '';
+
+            // Header
+            const thead = document.createElement('thead');
+            const headerRow = document.createElement('tr');
+            rows[0].forEach(cell => {
+                const th = document.createElement('th');
+                th.textContent = cell;
+                headerRow.appendChild(th);
+            });
+            thead.appendChild(headerRow);
+            table.appendChild(thead);
+
+            // Body
+            const tbody = document.createElement('tbody');
+            for (let i = 1; i < rows.length; i++) {
+                const tr = document.createElement('tr');
+                rows[i].forEach(cell => {
+                    const td = document.createElement('td');
+                    td.textContent = cell;
+                    tr.appendChild(td);
+                });
+                tbody.appendChild(tr);
+            }
+            table.appendChild(tbody);
+
+            document.getElementById('tableWrapper').style.display = 'block';
+            return rows.length - 1; // exclude header
+        }
+
+        // Simple CSV parser handling quoted fields
+        function parseCsvRows(csv) {
+            const rows = [];
+            let current = [];
+            let field = '';
+            let inQuotes = false;
+
+            for (let i = 0; i < csv.length; i++) {
+                const ch = csv[i];
+                if (inQuotes) {
+                    if (ch === '"' && csv[i + 1] === '"') {
+                        field += '"';
+                        i++;
+                    } else if (ch === '"') {
+                        inQuotes = false;
+                    } else {
+                        field += ch;
+                    }
+                } else if (ch === '"') {
+                    inQuotes = true;
+                } else if (ch === ',') {
+                    current.push(field);
+                    field = '';
+                } else if (ch === '\n') {
+                    current.push(field);
+                    field = '';
+                    if (current.some(c => c.length > 0)) rows.push(current);
+                    current = [];
+                } else if (ch === '\r') {
+                    // skip
+                } else {
+                    field += ch;
+                }
+            }
+            current.push(field);
+            if (current.some(c => c.length > 0)) rows.push(current);
+            return rows;
+        }
+
+        function download(content, ext) {
+            const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = `${fileName}.${ext}`;
+            a.click();
+            URL.revokeObjectURL(a.href);
+        }
+
+        function formatSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+            return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+        }
+
+        function showStatus(msg, type) {
+            const el = document.getElementById('status');
+            el.textContent = msg;
+            el.className = 'status ' + type;
+        }
+
+        // --- Event listeners ---
+
+        const dropZone = document.getElementById('dropZone');
+        const fileInput = document.getElementById('fileInput');
+
+        dropZone.addEventListener('click', () => fileInput.click());
+
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.classList.add('dragover');
+        });
+
+        dropZone.addEventListener('dragleave', () => {
+            dropZone.classList.remove('dragover');
+        });
+
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('dragover');
+            const file = e.dataTransfer.files[0];
+            if (file) processPdf(file);
+        });
+
+        fileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) processPdf(file);
+        });
+
+        document.getElementById('downloadCsv').addEventListener('click', () => {
+            download(csvData, 'csv');
+        });
+
+        document.getElementById('downloadTsv').addEventListener('click', () => {
+            download(tsvData, 'tsv');
+        });
+
+        document.getElementById('downloadTxt').addEventListener('click', () => {
+            download(txtData, 'txt');
+        });
+
+        document.getElementById('downloadMd').addEventListener('click', () => {
+            download(mdData, 'md');
+        });
+
+        document.getElementById('copyBtn').addEventListener('click', () => {
+            navigator.clipboard.writeText(csvData).then(() => {
+                showStatus('Copied to clipboard', 'success');
+            });
+        });
+
+        let rawVisible = false;
+        document.getElementById('toggleRaw').addEventListener('click', () => {
+            rawVisible = !rawVisible;
+            document.getElementById('rawCsv').style.display = rawVisible ? 'block' : 'none';
+            document.getElementById('toggleRaw').textContent = rawVisible ? 'Hide Raw' : 'Show Raw';
+        });
+
+        // Boot
+        initWasm();
+    </script>
+</body>
+</html>
