@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: web
-          image: pdf-table-extractor:latest
+          image: localhost:32000/pdf-table-extractor:latest
           ports:
             - containerPort: 8080
           resources:
@@ -55,11 +55,11 @@ kind: Ingress
 metadata:
   name: pdf-table-extractor
   annotations:
-    # Adjust for your ingress controller (nginx, traefik, etc.)
-    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
 spec:
+  ingressClassName: traefik
   rules:
-    - host: pdf.example.com  # Change to your domain
+    - host: pdf-parser.yosephbernandus.com
       http:
         paths:
           - path: /
