@@ -15,7 +15,7 @@ default = []
 wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook"]
 
 [lib]
-crate-type = ["rlib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 flate2 = "1.1.8"

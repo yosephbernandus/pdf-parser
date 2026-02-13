@@ -7,7 +7,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 COPY src/ src/
 
-RUN wasm-pack build --target web --release
+RUN wasm-pack build --target web --release -- --features wasm
 
 FROM nginx:alpine
 
