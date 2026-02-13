@@ -1,4 +1,4 @@
-use pdf_parser::{Document, Table};
+use pdf_text_extract::{Document, Table};
 use std::fs;
 
 fn main() {

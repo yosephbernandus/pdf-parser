@@ -1,5 +1,5 @@
 use std::fs;
-use pdf_parser::{classify_spans, elements_to_markdown, elements_to_txt, Document, Table};
+use pdf_text_extract::{classify_spans, elements_to_markdown, elements_to_txt, Document, Table};
 
 fn print_usage(program: &str) {
     eprintln!("Usage: {} <pdf-file> [options]", program);
