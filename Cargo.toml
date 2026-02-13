@@ -2,20 +2,28 @@
 name = "pdf-parser"
 version = "0.1.0"
 edition = "2024"
+authors = ["Yoseph Bernandus"]
+description = "Extract text, tables, and structured content from PDF files"
+license = "MIT"
+repository = "https://github.com/yosephbernandus/pdf-parser"
+keywords = ["pdf", "parser", "text-extraction", "table", "markdown"]
+categories = ["parser-implementations", "text-processing"]
+rust-version = "1.85"
+
+[features]
+default = []
+wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook"]
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
 flate2 = "1.1.8"
 thiserror = "2.0.18"
-wasm-bindgen = "0.2"
+wasm-bindgen = { version = "0.2", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-console_error_panic_hook = "0.1"
-
-[dev-dependencies]
-# For testing later
+console_error_panic_hook = { version = "0.1", optional = true }
 
 [[bin]]
 name = "pdf-table"
