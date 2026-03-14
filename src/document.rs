@@ -13,6 +13,9 @@ pub struct XRefEntry {
     pub offset: usize,
     pub generation: u16,
     pub in_use: bool,
+    /// If true, this object is compressed inside an object stream.
+    /// `offset` is the object stream number, `generation` is the index within that stream.
+    pub compressed: bool,
 }
 
 /// Parsed PDF document
@@ -114,15 +117,19 @@ impl<'a> Document<'a> {
                     break;
                 }
             } else {
-                // Might be an xref stream (PDF 1.5+)
-                // TODO: Implement xref stream parsing
-                if final_trailer.is_some() {
-                    // We have at least one valid xref, continue
+                // XRef stream (PDF 1.5+)
+                let (stream_trailer, prev) =
+                    Self::parse_xref_stream(data, current_offset, &mut xref)?;
+
+                if final_trailer.is_none() {
+                    final_trailer = Some(stream_trailer);
+                }
+
+                if let Some(prev_offset) = prev {
+                    current_offset = prev_offset;
+                } else {
                     break;
                 }
-                return Err(PdfError::InvalidStructure(
-                    "XRef streams not yet supported".into(),
-                ));
             }
         }
 
@@ -235,6 +242,7 @@ impl<'a> Document<'a> {
                             offset: entry_offset,
                             generation,
                             in_use,
+                            compressed: false,
                         },
                     );
                 }
@@ -286,6 +294,169 @@ impl<'a> Document<'a> {
         }
     }
 
+    /// Parse an XRef stream object (PDF 1.5+)
+    fn parse_xref_stream(
+        data: &[u8],
+        offset: usize,
+        xref: &mut HashMap<u32, XRefEntry>,
+    ) -> Result<(HashMap<String, PdfObject>, Option<usize>)> {
+        let mut parser = Parser::new(data);
+        parser.seek(offset);
+
+        // Parse "obj_num gen_num obj << ... >> stream ... endstream endobj"
+        // Skip obj_num
+        match parser.parse_object()? {
+            Some(PdfObject::Int(_)) => {}
+            _ => {
+                return Err(PdfError::InvalidStructure(
+                    "Expected object number at XRef stream offset".into(),
+                ));
+            }
+        }
+        // Skip gen_num
+        match parser.parse_object()? {
+            Some(PdfObject::Int(_)) => {}
+            _ => {
+                return Err(PdfError::InvalidStructure(
+                    "Expected generation number at XRef stream".into(),
+                ));
+            }
+        }
+        // Parse the stream object (parser handles "obj" keyword + dict + stream)
+        let stream_obj = parser.parse_object()?.ok_or_else(|| {
+            PdfError::InvalidStructure("Failed to parse XRef stream object".into())
+        })?;
+
+        let (dict, raw_data) = match &stream_obj {
+            PdfObject::Stream { dict, data } => (dict, data),
+            _ => {
+                return Err(PdfError::InvalidStructure(
+                    "XRef stream offset does not point to a stream object".into(),
+                ));
+            }
+        };
+
+        // Decode the stream data
+        let decoded = decode_stream(dict, raw_data)?;
+
+        // Get /W array (field widths)
+        let w = dict
+            .get("W")
+            .and_then(|w| w.as_array())
+            .ok_or_else(|| PdfError::InvalidStructure("XRef stream missing /W array".into()))?;
+
+        if w.len() != 3 {
+            return Err(PdfError::InvalidStructure(
+                "XRef stream /W must have 3 entries".into(),
+            ));
+        }
+
+        let w1 = w[0].as_int().unwrap_or(0) as usize;
+        let w2 = w[1].as_int().unwrap_or(0) as usize;
+        let w3 = w[2].as_int().unwrap_or(0) as usize;
+        let entry_size = w1 + w2 + w3;
+
+        if entry_size == 0 {
+            return Err(PdfError::InvalidStructure(
+                "XRef stream entry size is 0".into(),
+            ));
+        }
+
+        // Get /Index array (subsection ranges), default to [0 Size]
+        let size = dict
+            .get("Size")
+            .and_then(|s| s.as_int())
+            .unwrap_or(0) as u32;
+
+        let index_pairs: Vec<(u32, u32)> = if let Some(index_arr) = dict.get("Index").and_then(|i| i.as_array()) {
+            index_arr
+                .chunks(2)
+                .map(|pair| {
+                    let start = pair[0].as_int().unwrap_or(0) as u32;
+                    let count = pair.get(1).and_then(|c| c.as_int()).unwrap_or(0) as u32;
+                    (start, count)
+                })
+                .collect()
+        } else {
+            vec![(0, size)]
+        };
+
+        // Parse binary entries
+        let mut pos = 0;
+        for (start_obj, count) in &index_pairs {
+            for i in 0..*count {
+                if pos + entry_size > decoded.len() {
+                    break;
+                }
+
+                let field1 = Self::read_xref_field(&decoded[pos..], w1, 1); // default type=1
+                let field2 = Self::read_xref_field(&decoded[pos + w1..], w2, 0);
+                let field3 = Self::read_xref_field(&decoded[pos + w1 + w2..], w3, 0);
+                pos += entry_size;
+
+                let obj_num = start_obj + i;
+
+                // Don't overwrite existing entries (most recent xref takes priority)
+                if xref.contains_key(&obj_num) {
+                    continue;
+                }
+
+                match field1 {
+                    0 => {
+                        // Type 0: free object — skip
+                    }
+                    1 => {
+                        // Type 1: regular object at byte offset
+                        xref.insert(
+                            obj_num,
+                            XRefEntry {
+                                offset: field2 as usize,
+                                generation: field3 as u16,
+                                in_use: true,
+                                compressed: false,
+                            },
+                        );
+                    }
+                    2 => {
+                        // Type 2: compressed in object stream
+                        // field2 = object stream number, field3 = index within stream
+                        xref.insert(
+                            obj_num,
+                            XRefEntry {
+                                offset: field2 as usize,  // obj stream number
+                                generation: field3 as u16, // index in stream
+                                in_use: true,
+                                compressed: true,
+                            },
+                        );
+                    }
+                    _ => {
+                        // Unknown type — skip
+                    }
+                }
+            }
+        }
+
+        // Build trailer from stream dictionary (XRef streams serve as both xref and trailer)
+        let trailer: HashMap<String, PdfObject> = dict.clone();
+
+        let prev = trailer.get("Prev").and_then(|p| p.as_int()).map(|p| p as usize);
+
+        Ok((trailer, prev))
+    }
+
+    /// Read a multi-byte big-endian integer field from XRef stream data
+    fn read_xref_field(data: &[u8], width: usize, default: u64) -> u64 {
+        if width == 0 {
+            return default;
+        }
+        let mut val: u64 = 0;
+        for i in 0..width {
+            val = (val << 8) | data[i] as u64;
+        }
+        val
+    }
+
     /// Get the trailer dictionary
     pub fn trailer(&self) -> &HashMap<String, PdfObject> {
         &self.trailer
@@ -309,8 +480,19 @@ impl<'a> Document<'a> {
         })?;
 
         let entry_offset = entry.offset;
+        let is_compressed = entry.compressed;
+        let index_in_stream = entry.generation;
 
-        // Parse object at offset
+        if is_compressed {
+            // Type 2: Object is compressed inside an object stream
+            let obj_stream_num = entry_offset as u32;
+            let parsed_obj =
+                self.resolve_from_object_stream(obj_stream_num, index_in_stream as usize)?;
+            self.cache.insert(obj_ref, parsed_obj);
+            return Ok(self.cache.get(&obj_ref).unwrap());
+        }
+
+        // Type 1: Regular object at byte offset
         let mut parser = Parser::new(self.data);
         parser.seek(entry_offset);
 
@@ -347,6 +529,85 @@ impl<'a> Document<'a> {
         // Cache and return
         self.cache.insert(obj_ref, parsed_obj);
         Ok(self.cache.get(&obj_ref).unwrap())
+    }
+
+    /// Resolve an object from an object stream (/ObjStm)
+    fn resolve_from_object_stream(
+        &mut self,
+        obj_stream_num: u32,
+        index: usize,
+    ) -> Result<PdfObject> {
+        // First, resolve the object stream itself (must be a regular type 1 entry)
+        let stream_ref = ObjRef::new(obj_stream_num, 0);
+        let stream_obj = self.resolve(stream_ref)?.clone();
+
+        let (dict, raw_data) = match &stream_obj {
+            PdfObject::Stream { dict, data } => (dict.clone(), data.clone()),
+            _ => {
+                return Err(PdfError::InvalidStructure(
+                    "Object stream is not a stream".into(),
+                ));
+            }
+        };
+
+        // Decode the object stream
+        let decoded = decode_stream(&dict, &raw_data)?;
+
+        // Get /N (number of objects) and /First (byte offset of first object in stream)
+        let n = dict
+            .get("N")
+            .and_then(|n| n.as_int())
+            .ok_or_else(|| PdfError::InvalidStructure("ObjStm missing /N".into()))?
+            as usize;
+
+        let first = dict
+            .get("First")
+            .and_then(|f| f.as_int())
+            .ok_or_else(|| PdfError::InvalidStructure("ObjStm missing /First".into()))?
+            as usize;
+
+        if index >= n {
+            return Err(PdfError::InvalidStructure(format!(
+                "ObjStm index {} out of range (N={})",
+                index, n
+            )));
+        }
+
+        // Parse the header: pairs of (obj_num, byte_offset) for each object
+        let mut header_parser = Parser::new(&decoded);
+        let mut offsets = Vec::with_capacity(n);
+
+        for _ in 0..n {
+            let _obj_num = match header_parser.parse_object()? {
+                Some(PdfObject::Int(num)) => num,
+                _ => {
+                    return Err(PdfError::InvalidStructure(
+                        "Invalid ObjStm header".into(),
+                    ));
+                }
+            };
+            let byte_offset = match header_parser.parse_object()? {
+                Some(PdfObject::Int(off)) => off as usize,
+                _ => {
+                    return Err(PdfError::InvalidStructure(
+                        "Invalid ObjStm header".into(),
+                    ));
+                }
+            };
+            offsets.push(byte_offset);
+        }
+
+        // Parse the object at the given index
+        let obj_offset = first + offsets[index];
+        let mut obj_parser = Parser::new(&decoded);
+        obj_parser.seek(obj_offset);
+
+        obj_parser.parse_object()?.ok_or_else(|| {
+            PdfError::InvalidStructure(format!(
+                "Failed to parse object at index {} in ObjStm {}",
+                index, obj_stream_num
+            ))
+        })
     }
 
     /// Get an object, resolving references automatically
