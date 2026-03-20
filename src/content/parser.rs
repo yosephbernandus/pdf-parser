@@ -152,6 +152,10 @@ impl<'a> ContentParser<'a> {
         });
 
         let mut merged: Vec<TextSpan> = Vec::new();
+        // Track position of the last raw span to avoid cumulative error
+        // from estimating positions based on the entire merged text length
+        let mut last_raw_x: f64 = 0.0;
+        let mut last_raw_char_count: usize = 0;
 
         for span in sorted_spans {
             if let Some(last) = merged.last_mut() {
@@ -160,31 +164,56 @@ impl<'a> ContentParser<'a> {
                 let same_line = (span.y - last.y).abs() <= y_tolerance;
 
                 if same_line && last.font_name == span.font_name {
-                    // Estimate expected position based on accumulated text length
-                    // Use font_size * 0.5 as average character width estimate
                     let char_width = last.font_size * 0.5;
-                    let expected_x = last.x + (last.text.len() as f64 * char_width);
-                    let gap = span.x - expected_x;
 
-                    // If gap is small, merge without space
-                    // If gap is moderate (word boundary), merge with space
-                    // If gap is large, start new span
-                    if gap < char_width * 0.8 && gap > -char_width * 2.0 {
-                        // Small gap - just append
-                        last.text.push_str(&span.text);
-                    } else if gap < char_width * 2.0 {
-                        // Word boundary - append with space
-                        last.text.push(' ');
-                        last.text.push_str(&span.text);
+                    // Check if we're in per-character mode (individual Td+Tj per glyph)
+                    // vs multi-character mode (TJ arrays or multi-char Tj strings)
+                    let per_char_mode = last_raw_char_count <= 1 && span.text.chars().count() <= 1;
+
+                    if per_char_mode {
+                        // Per-character mode: use last raw span position to avoid
+                        // cumulative error. Word boundaries come from preserved
+                        // space glyphs, so we just need to concatenate nearby chars.
+                        let expected_end = last_raw_x + (last_raw_char_count as f64 * char_width);
+                        let gap = span.x - expected_end;
+
+                        if gap < char_width * 3.0 && gap > -char_width * 3.0 {
+                            // Same text run - merge
+                            last.text.push_str(&span.text);
+                        } else {
+                            // Large gap - new span (different column)
+                            merged.push(span.clone());
+                        }
                     } else {
-                        // Large gap - new span
-                        merged.push(span);
+                        // Multi-character mode: use gap-based space detection
+                        // Position estimation uses last raw span, not full merged text
+                        let expected_end = last_raw_x + (last_raw_char_count as f64 * char_width);
+                        let gap = span.x - expected_end;
+
+                        if gap < char_width * 0.8 && gap > -char_width * 2.0 {
+                            // Small gap - just append
+                            last.text.push_str(&span.text);
+                        } else if gap < char_width * 2.0 {
+                            // Word boundary - append with space
+                            last.text.push(' ');
+                            last.text.push_str(&span.text);
+                        } else {
+                            // Large gap - new span
+                            merged.push(span.clone());
+                        }
                     }
+
+                    last_raw_x = span.x;
+                    last_raw_char_count = span.text.chars().count();
                 } else {
                     // Different line or font - new span
+                    last_raw_x = span.x;
+                    last_raw_char_count = span.text.chars().count();
                     merged.push(span);
                 }
             } else {
+                last_raw_x = span.x;
+                last_raw_char_count = span.text.chars().count();
                 merged.push(span);
             }
         }
@@ -682,11 +711,22 @@ impl<'a> ContentParser<'a> {
             self.decode_default(bytes)
         };
 
-        let text = text.trim().to_string();
+        // Check if original text was whitespace-only before trimming
+        let is_whitespace_only = !text.is_empty() && text.trim().is_empty();
+        let trimmed = text.trim().to_string();
 
-        if !text.is_empty() {
+        if !trimmed.is_empty() {
             self.spans.push(TextSpan {
-                text,
+                text: trimmed,
+                x,
+                y,
+                font_size: self.state.font_size,
+                font_name: self.state.font_name.clone(),
+            });
+        } else if is_whitespace_only {
+            // Preserve space characters as word boundary markers
+            self.spans.push(TextSpan {
+                text: " ".to_string(),
                 x,
                 y,
                 font_size: self.state.font_size,
